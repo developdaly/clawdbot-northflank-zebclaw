@@ -15,20 +15,20 @@ for (const suffix of ["PUBLIC_PORT", "STATE_DIR", "WORKSPACE_DIR", "GATEWAY_TOKE
   const newKey = `OPENCLAW_${suffix}`;
   if (process.env[oldKey] && !process.env[newKey]) {
     process.env[newKey] = process.env[oldKey];
-    console.warn(`[migration] Copied ${oldKey} → ${newKey}. Please rename this variable on Northflank.`);
+    // Best-effort compatibility shim for old Northflank templates.
+    // Intentionally no warning: Northflank templates can still set legacy keys and warnings are noisy.
   }
+  // Avoid forwarding legacy variables into OpenClaw subprocesses.
+  // OpenClaw logs a warning when deprecated CLAWDBOT_* variables are present.
+  delete process.env[oldKey];
 }
 
-// Northflank deployments sometimes inject PORT=3000 by default. We want the wrapper to
-// reliably listen on 8080 unless explicitly overridden.
+// Northflank injects PORT at runtime and routes traffic to that port.
+// Do not force a different public port in the container image, or the service may
+// boot but the Northflank domain will be routed to a different port.
 //
-// Prefer OPENCLAW_PUBLIC_PORT (set in the Dockerfile / template) over PORT.
-const PORT = Number.parseInt(
-  process.env.OPENCLAW_PUBLIC_PORT?.trim() ??
-    process.env.PORT ??
-    "8080",
-  10,
-);
+// OPENCLAW_PUBLIC_PORT is kept as an escape hatch for non-Northflank deployments.
+const PORT = Number.parseInt(process.env.PORT ?? process.env.OPENCLAW_PUBLIC_PORT ?? "8080", 10);
 
 // State/workspace
 // OpenClaw defaults to ~/.openclaw.
@@ -705,14 +705,16 @@ function runCmd(cmd, args, opts = {}) {
 
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   try {
-    const safeWrite = (msg) => {
-      try {
-        if (!res.writableEnded) res.write(String(msg) + "\n");
-      } catch {}
+    const respondJson = (status, body) => {
+      if (res.writableEnded || res.headersSent) return;
+      res.status(status).json(body);
     };
     if (isConfigured()) {
       await ensureGatewayRunning();
-      return res.json({ ok: true, output: "Already configured.\nUse Reset setup if you want to rerun onboarding.\n" });
+      return respondJson(200, {
+        ok: true,
+        output: "Already configured.\nUse Reset setup if you want to rerun onboarding.\n",
+      });
     }
 
     fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -724,10 +726,10 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     try {
       onboardArgs = buildOnboardArgs(payload);
     } catch (err) {
-      return res.status(400).json({ ok: false, output: `Setup input error: ${String(err)}` });
+      return respondJson(400, { ok: false, output: `Setup input error: ${String(err)}` });
     }
 
-    safeWrite("[setup] running openclaw onboard...");
+    const prefix = "[setup] running openclaw onboard...\n";
     const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
 
   let extra = "";
@@ -874,13 +876,13 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     await restartGateway();
   }
 
-  return res.status(ok ? 200 : 500).json({
+  return respondJson(ok ? 200 : 500, {
     ok,
-    output: `${onboard.output}${extra}`,
+    output: `${prefix}${onboard.output}${extra}`,
   });
   } catch (err) {
     console.error("[/setup/api/run] error:", err);
-    return res.status(500).json({ ok: false, output: `Internal error: ${String(err)}` });
+    return respondJson(500, { ok: false, output: `Internal error: ${String(err)}` });
   }
 });
 
@@ -1326,7 +1328,44 @@ proxy.on("error", (err, _req, res) => {
   }
 });
 
-app.use(async (req, res) => {
+// --- Dashboard password protection ---
+// Require the same SETUP_PASSWORD for the entire Control UI dashboard,
+// not just the /setup routes.  Healthcheck is excluded so Northflank probes work.
+function requireDashboardAuth(req, res, next) {
+  if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
+  if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
+  if (!SETUP_PASSWORD) return next(); // no password configured → open
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
+  if (scheme !== "Basic" || !encoded) {
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
+    return res.status(401).send("Auth required");
+  }
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+  if (password !== SETUP_PASSWORD) {
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
+    return res.status(401).send("Invalid password");
+  }
+  return next();
+}
+
+// --- Gateway token injection ---
+// The gateway is only reachable from this container. The Control UI in the browser
+// cannot set custom Authorization headers for WebSocket connections, so we inject
+// the token into proxied requests at the wrapper level.
+function attachGatewayAuthHeader(req) {
+  if (!req?.headers?.authorization && OPENCLAW_GATEWAY_TOKEN) {
+    req.headers.authorization = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
+  }
+}
+
+proxy.on("proxyReqWs", (_proxyReq, req) => {
+  attachGatewayAuthHeader(req);
+});
+
+app.use(requireDashboardAuth, async (req, res) => {
   // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
     return res.redirect("/setup");
@@ -1348,6 +1387,7 @@ app.use(async (req, res) => {
     }
   }
 
+  attachGatewayAuthHeader(req);
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1370,6 +1410,42 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
   }
 
+  // Optional operator hook to install/persist extra tools under /data.
+  // This is intentionally best-effort and should be used to set up persistent
+  // prefixes (npm/pnpm/python venv), not to mutate the base image.
+  const bootstrapPath = path.join(WORKSPACE_DIR, "bootstrap.sh");
+  if (fs.existsSync(bootstrapPath)) {
+    console.log(`[wrapper] running bootstrap: ${bootstrapPath}`);
+    try {
+      await runCmd("bash", [bootstrapPath], {
+        env: {
+          ...process.env,
+          OPENCLAW_STATE_DIR: STATE_DIR,
+          OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+        },
+        timeoutMs: 10 * 60 * 1000,
+      });
+      console.log("[wrapper] bootstrap complete");
+    } catch (err) {
+      console.warn(`[wrapper] bootstrap failed (continuing): ${String(err)}`);
+    }
+  }
+
+  // Sync gateway tokens in config with the current env var on every startup.
+  // This prevents "gateway token mismatch" when OPENCLAW_GATEWAY_TOKEN changes
+  // (e.g. Northflank variable update) but the config file still has the old value.
+  if (isConfigured() && OPENCLAW_GATEWAY_TOKEN) {
+    console.log("[wrapper] syncing gateway tokens in config...");
+    try {
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+      await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+      console.log("[wrapper] gateway tokens synced");
+    } catch (err) {
+      console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
+    }
+  }
+
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
   // work even if nobody visits the web UI.
   if (isConfigured()) {
@@ -1384,6 +1460,10 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 });
 
 server.on("upgrade", async (req, socket, head) => {
+  // Note: browsers cannot attach arbitrary HTTP headers (including Authorization: Basic)
+  // in WebSocket handshakes. Do not enforce dashboard Basic auth at the upgrade layer.
+  // The gateway authenticates at the protocol layer and we inject the gateway token below.
+
   if (!isConfigured()) {
     socket.destroy();
     return;
@@ -1394,6 +1474,7 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
+  attachGatewayAuthHeader(req);
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
