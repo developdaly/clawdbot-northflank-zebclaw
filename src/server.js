@@ -271,6 +271,31 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
+// --- Privisy CCPA Scanner auto-start ---
+let privIsyProc = null;
+
+function startPrivisy() {
+  if (privIsyProc) return;
+  const backendEntry = path.join(WORKSPACE_DIR, "../privisy/packages/backend/dist/index.js");
+  if (!fs.existsSync(backendEntry)) {
+    console.log("[privisy] backend not found at", backendEntry, "— skipping auto-start");
+    return;
+  }
+  console.log("[privisy] starting backend on port", PRIVISY_PORT);
+  privIsyProc = childProcess.spawn(process.execPath, [backendEntry], {
+    stdio: "inherit",
+    env: { ...process.env, PORT: String(PRIVISY_PORT) },
+  });
+  privIsyProc.on("error", (err) => {
+    console.error("[privisy] spawn error:", err.message);
+    privIsyProc = null;
+  });
+  privIsyProc.on("exit", (code, signal) => {
+    console.log(`[privisy] exited (code=${code}, signal=${signal}) — will restart on next request`);
+    privIsyProc = null;
+  });
+}
+
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res
@@ -1387,6 +1412,7 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
 app.use(requireDashboardAuth, async (req, res) => {
   // Route /privisy/* to the Privisy CCPA Scanner backend (strip prefix).
   if (req.path.startsWith("/privisy")) {
+    if (!privIsyProc) startPrivisy(); // lazy restart if backend crashed
     req.url = req.url.replace(/^\/privisy/, "") || "/";
     return privIsyProxy.web(req, res);
   }
@@ -1420,6 +1446,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] listening on :${PORT}`);
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
   console.log(`[wrapper] workspace dir: ${WORKSPACE_DIR}`);
+
+  // Start Privisy CCPA scanner backend
+  startPrivisy();
 
   // Harden state dir for OpenClaw and avoid missing credentials dir on fresh volumes.
   try {
