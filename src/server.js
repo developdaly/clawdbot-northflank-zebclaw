@@ -322,6 +322,15 @@ function requireSetupAuth(req, res, next) {
 
 const app = express();
 app.disable("x-powered-by");
+
+// Privisy proxy MUST be before express.json() — body parser consumes the
+// request stream, leaving http-proxy nothing to forward; POST requests hang.
+app.use("/privisy", (req, res) => {
+  if (!privIsyProc) startPrivisy();
+  req.url = req.url || "/";
+  return privIsyProxy.web(req, res);
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 // Minimal health endpoint for Northflank.
@@ -1410,13 +1419,6 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
 });
 
 app.use(requireDashboardAuth, async (req, res) => {
-  // Route /privisy/* to the Privisy CCPA Scanner backend (strip prefix).
-  if (req.path.startsWith("/privisy")) {
-    if (!privIsyProc) startPrivisy(); // lazy restart if backend crashed
-    req.url = req.url.replace(/^\/privisy/, "") || "/";
-    return privIsyProxy.web(req, res);
-  }
-
   // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
     return res.redirect("/setup");
