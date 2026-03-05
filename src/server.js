@@ -276,15 +276,16 @@ let privIsyProc = null;
 
 function startPrivisy() {
   if (privIsyProc) return;
-  const backendEntry = path.join(WORKSPACE_DIR, "../privisy/packages/backend/dist/index.js");
+  const backendEntry = path.join(WORKSPACE_DIR, "privisy/packages/backend/start.js");
   if (!fs.existsSync(backendEntry)) {
     console.log("[privisy] backend not found at", backendEntry, "— skipping auto-start");
     return;
   }
+  const playwrightCache = process.env.PLAYWRIGHT_BROWSERS_PATH || "/opt/render/project/.cache/playwright";
   console.log("[privisy] starting backend on port", PRIVISY_PORT);
   privIsyProc = childProcess.spawn(process.execPath, [backendEntry], {
     stdio: "inherit",
-    env: { ...process.env, PORT: String(PRIVISY_PORT) },
+    env: { ...process.env, PORT: String(PRIVISY_PORT), PLAYWRIGHT_BROWSERS_PATH: playwrightCache },
   });
   privIsyProc.on("error", (err) => {
     console.error("[privisy] spawn error:", err.message);
