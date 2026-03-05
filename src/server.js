@@ -1328,12 +1328,31 @@ proxy.on("error", (err, _req, res) => {
   }
 });
 
+// --- Privisy CCPA Scanner proxy ---
+// Route /privisy/* → Privisy backend on port 3002 (strips the /privisy prefix).
+const PRIVISY_PORT = Number.parseInt(process.env.PRIVISY_PORT ?? "3002", 10);
+const PRIVISY_TARGET = `http://127.0.0.1:${PRIVISY_PORT}`;
+const privIsyProxy = httpProxy.createProxyServer({
+  target: PRIVISY_TARGET,
+  xfwd: true,
+});
+privIsyProxy.on("error", (err, _req, res) => {
+  console.error("[privisy-proxy]", err.message);
+  try {
+    if (res && typeof res.writeHead === "function" && !res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end("Privisy backend unavailable\n");
+    }
+  } catch { /* ignore */ }
+});
+
 // --- Dashboard password protection ---
 // Require the same SETUP_PASSWORD for the entire Control UI dashboard,
 // not just the /setup routes.  Healthcheck is excluded so Northflank probes work.
 function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
   if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
+  if (req.path.startsWith("/privisy")) return next(); // Privisy CCPA scanner is publicly accessible
   if (!SETUP_PASSWORD) return next(); // no password configured → open
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
@@ -1366,6 +1385,12 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
 });
 
 app.use(requireDashboardAuth, async (req, res) => {
+  // Route /privisy/* to the Privisy CCPA Scanner backend (strip prefix).
+  if (req.path.startsWith("/privisy")) {
+    req.url = req.url.replace(/^\/privisy/, "") || "/";
+    return privIsyProxy.web(req, res);
+  }
+
   // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
     return res.redirect("/setup");
