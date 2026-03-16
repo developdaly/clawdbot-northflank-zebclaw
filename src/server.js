@@ -271,64 +271,6 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
-// --- Privisy CCPA Scanner auto-start ---
-let privIsyProc = null;
-let privIsyLastFailAt = 0;
-const PRIVISY_RETRY_COOLDOWN_MS = 10_000;
-
-/** Quick health probe — returns true if something is already listening on the Privisy port */
-async function checkPrivisyAlive() {
-  try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 1500);
-    const r = await fetch(`http://127.0.0.1:${PRIVISY_PORT}/api/health`, { signal: ctrl.signal });
-    clearTimeout(t);
-    return r.ok;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Ensure Privisy is running. Safe to call on every request:
- *  - no-ops if privIsyProc is set
- *  - no-ops if port is already alive (e.g. process survived a wrapper restart, or manual start)
- *  - applies a 10s cooldown after a failed spawn to avoid hammering the port
- */
-async function ensurePrivisyRunning() {
-  if (privIsyProc) return;
-  const now = Date.now();
-  if (now - privIsyLastFailAt < PRIVISY_RETRY_COOLDOWN_MS) return;
-  // Don't spawn if something already has the port (manual start or stale process)
-  if (await checkPrivisyAlive()) return;
-  startPrivisy();
-}
-
-function startPrivisy() {
-  if (privIsyProc) return;
-  const backendEntry = path.join(WORKSPACE_DIR, "privisy/packages/backend/start.js");
-  if (!fs.existsSync(backendEntry)) {
-    console.log("[privisy] backend not found at", backendEntry, "— skipping auto-start");
-    return;
-  }
-  const playwrightCache = process.env.PLAYWRIGHT_BROWSERS_PATH || "/opt/render/project/.cache/playwright";
-  console.log("[privisy] starting backend on port", PRIVISY_PORT);
-  privIsyProc = childProcess.spawn(process.execPath, [backendEntry], {
-    stdio: "inherit",
-    env: { ...process.env, PORT: String(PRIVISY_PORT), PLAYWRIGHT_BROWSERS_PATH: playwrightCache },
-  });
-  privIsyProc.on("error", (err) => {
-    console.error("[privisy] spawn error:", err.message);
-    privIsyLastFailAt = Date.now();
-    privIsyProc = null;
-  });
-  privIsyProc.on("exit", (code, signal) => {
-    console.log(`[privisy] exited (code=${code}, signal=${signal}) — will restart on next request`);
-    privIsyLastFailAt = Date.now();
-    privIsyProc = null;
-  });
-}
-
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res
@@ -355,15 +297,6 @@ function requireSetupAuth(req, res, next) {
 
 const app = express();
 app.disable("x-powered-by");
-
-// Privisy proxy MUST be before express.json() — body parser consumes the
-// request stream, leaving http-proxy nothing to forward; POST requests hang.
-app.use("/privisy", (req, res) => {
-  ensurePrivisyRunning(); // async but fire-and-forget; proxy will 502 on first hit if not up yet
-  req.url = req.url || "/";
-  return privIsyProxy.web(req, res);
-});
-
 app.use(express.json({ limit: "1mb" }));
 
 // Minimal health endpoint for Northflank.
@@ -1395,31 +1328,12 @@ proxy.on("error", (err, _req, res) => {
   }
 });
 
-// --- Privisy CCPA Scanner proxy ---
-// Route /privisy/* → Privisy backend on port 3002 (strips the /privisy prefix).
-const PRIVISY_PORT = Number.parseInt(process.env.PRIVISY_PORT ?? "3002", 10);
-const PRIVISY_TARGET = `http://127.0.0.1:${PRIVISY_PORT}`;
-const privIsyProxy = httpProxy.createProxyServer({
-  target: PRIVISY_TARGET,
-  xfwd: true,
-});
-privIsyProxy.on("error", (err, _req, res) => {
-  console.error("[privisy-proxy]", err.message);
-  try {
-    if (res && typeof res.writeHead === "function" && !res.headersSent) {
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end("Privisy backend unavailable\n");
-    }
-  } catch { /* ignore */ }
-});
-
 // --- Dashboard password protection ---
 // Require the same SETUP_PASSWORD for the entire Control UI dashboard,
 // not just the /setup routes.  Healthcheck is excluded so Northflank probes work.
 function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
   if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
-  if (req.path.startsWith("/privisy")) return next(); // Privisy CCPA scanner is publicly accessible
   if (!SETUP_PASSWORD) return next(); // no password configured → open
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
@@ -1481,9 +1395,6 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] listening on :${PORT}`);
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
   console.log(`[wrapper] workspace dir: ${WORKSPACE_DIR}`);
-
-  // Start Privisy CCPA scanner backend (health-checks first to avoid EADDRINUSE)
-  ensurePrivisyRunning();
 
   // Harden state dir for OpenClaw and avoid missing credentials dir on fresh volumes.
   try {
