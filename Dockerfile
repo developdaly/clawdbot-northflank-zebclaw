@@ -49,7 +49,7 @@ RUN apt-get update \
 # Pin to a known-good commit. Override GSTACK_GIT_REF to track a branch or tag.
 ARG GSTACK_GIT_REF=feat/missioncontrol
 RUN git clone --depth 1 --branch "${GSTACK_GIT_REF}" \
-      https://github.com/garrytan/gstack.git /gstack
+      https://github.com/developdaly/gstack.git /gstack
 
 WORKDIR /gstack/missioncontrol
 
