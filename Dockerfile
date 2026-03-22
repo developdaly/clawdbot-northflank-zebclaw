@@ -39,6 +39,24 @@ ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:install && pnpm ui:build
 
 
+# ── Mission Control build stage ──────────────────────────────────
+FROM oven/bun:1 AS mc-build
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Pin to a known-good commit. Override GSTACK_GIT_REF to track a branch or tag.
+ARG GSTACK_GIT_REF=feat/missioncontrol
+RUN git clone --depth 1 --branch "${GSTACK_GIT_REF}" \
+      https://github.com/garrytan/gstack.git /gstack
+
+WORKDIR /gstack/missioncontrol
+
+# Compile to a self-contained binary
+RUN bun build --compile src/cli.ts --outfile dist/missioncontrol
+
+
 # Runtime image
 FROM node:22-bookworm
 ENV NODE_ENV=production
@@ -100,6 +118,15 @@ COPY --from=openclaw-build /openclaw /openclaw
 # Provide an openclaw executable
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"' > /usr/local/bin/openclaw \
   && chmod +x /usr/local/bin/openclaw
+
+# Add Bun runtime (needed by Mission Control server.ts)
+COPY --from=oven/bun:1 /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=oven/bun:1 /usr/local/bin/bunx /usr/local/bin/bunx
+
+# Copy Mission Control compiled binary and TypeScript source
+COPY --from=mc-build /gstack/missioncontrol/dist/missioncontrol /missioncontrol/dist/missioncontrol
+COPY --from=mc-build /gstack/missioncontrol/src/ /missioncontrol/src/
+RUN echo "built" > /missioncontrol/dist/.version
 
 COPY src ./src
 

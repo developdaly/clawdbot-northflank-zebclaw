@@ -75,6 +75,10 @@ const INTERNAL_GATEWAY_PORT = Number.parseInt(process.env.INTERNAL_GATEWAY_PORT 
 const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
 const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
 
+// Mission Control internal address
+const MC_INTERNAL_PORT = process.env.MC_INTERNAL_PORT || "18790";
+const MC_INTERNAL_HOST = process.env.MC_INTERNAL_HOST || "127.0.0.1";
+
 // Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
 const OPENCLAW_ENTRY = process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
@@ -269,6 +273,40 @@ async function restartGateway() {
     gatewayProc = null;
   }
   return ensureGatewayRunning();
+}
+
+// ── Mission Control ──────────────────────────────────────────────────────────
+let mcProcess = null;
+
+function startMissionControl() {
+  if (mcProcess) return;
+
+  const mcEnv = {
+    ...process.env,
+    MC_PORT: MC_INTERNAL_PORT,
+    MC_STATE_FILE: "/data/.gstack/missioncontrol-server.json",
+    MISSION_CONTROL_PASSWORD: process.env.MISSION_CONTROL_PASSWORD || process.env.SETUP_PASSWORD || "",
+    OPENCLAW_WEBHOOK_URL: `http://127.0.0.1:${INTERNAL_GATEWAY_PORT}/hooks`,
+  };
+
+  mcProcess = childProcess.spawn(
+    "bun", ["run", "/missioncontrol/src/server.ts"],
+    { env: mcEnv, stdio: "inherit" },
+  );
+
+  mcProcess.on("error", (err) => {
+    console.error(`[missioncontrol] Spawn error: ${String(err)}`);
+    mcProcess = null;
+    setTimeout(startMissionControl, 2000);
+  });
+
+  mcProcess.on("exit", (code) => {
+    console.log(`[missioncontrol] Process exited with code ${code}`);
+    mcProcess = null;
+    setTimeout(startMissionControl, 2000);
+  });
+
+  console.log(`[missioncontrol] Starting on ${MC_INTERNAL_HOST}:${MC_INTERNAL_PORT}`);
 }
 
 function requireSetupAuth(req, res, next) {
@@ -1316,6 +1354,24 @@ const proxy = httpProxy.createProxyServer({
   xfwd: true,
 });
 
+// Mission Control proxy (no ws needed; MC serves HTTP only).
+const mcProxy = httpProxy.createProxyServer({
+  target: `http://${MC_INTERNAL_HOST}:${MC_INTERNAL_PORT}`,
+  xfwd: true,
+});
+
+mcProxy.on("error", (err, _req, res) => {
+  console.error("[missioncontrol] proxy error:", err.message);
+  try {
+    if (res && typeof res.writeHead === "function" && !res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Mission Control unavailable" }));
+    }
+  } catch {
+    // ignore
+  }
+});
+
 proxy.on("error", (err, _req, res) => {
   console.error("[proxy]", err);
   try {
@@ -1363,6 +1419,20 @@ function attachGatewayAuthHeader(req) {
 
 proxy.on("proxyReqWs", (_proxyReq, req) => {
   attachGatewayAuthHeader(req);
+});
+
+// Mission Control — proxy /missioncontrol/* to the internal MC server.
+// Express strips the /missioncontrol prefix from req.url before calling this handler,
+// so /missioncontrol/api/state → /api/state as seen by the MC server.
+app.use("/missioncontrol", (_req, res, next) => {
+  // MC manages its own auth via MISSION_CONTROL_PASSWORD — don't apply dashboard auth here.
+  mcProxy.web(_req, res, {}, (err) => {
+    console.error(`[missioncontrol] Proxy error: ${String(err)}`);
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Mission Control unavailable" }));
+    }
+  });
 });
 
 app.use(requireDashboardAuth, async (req, res) => {
@@ -1457,6 +1527,9 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
     }
   }
+
+  // Start Mission Control regardless of gateway state.
+  startMissionControl();
 });
 
 server.on("upgrade", async (req, socket, head) => {
@@ -1482,6 +1555,11 @@ process.on("SIGTERM", () => {
   // Best-effort shutdown
   try {
     if (gatewayProc) gatewayProc.kill("SIGTERM");
+  } catch {
+    // ignore
+  }
+  try {
+    if (mcProcess) mcProcess.kill("SIGTERM");
   } catch {
     // ignore
   }
