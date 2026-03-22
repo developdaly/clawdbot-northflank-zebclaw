@@ -296,7 +296,7 @@ function startMissionControl() {
     MC_PORT: MC_INTERNAL_PORT,
     MC_STATE_FILE: "/data/.gstack/missioncontrol-server.json",
     MISSION_CONTROL_PASSWORD: process.env.MISSION_CONTROL_PASSWORD || process.env.SETUP_PASSWORD || "",
-    OPENCLAW_WEBHOOK_URL: `http://127.0.0.1:${INTERNAL_GATEWAY_PORT}/hooks`,
+    OPENCLAW_WEBHOOK_URL: `http://127.0.0.1:${PORT}/hooks/missioncontrol`,
   };
 
   console.log(`[missioncontrol] Using source: ${mcSrc}`);
@@ -318,6 +318,162 @@ function startMissionControl() {
   });
 
   console.log(`[missioncontrol] Starting on ${MC_INTERNAL_HOST}:${MC_INTERNAL_PORT}`);
+}
+
+// ── Mission Control Webhook Handler ─────────────────────────────────────────
+// When MC fires a webhook for a card moved to a skill column, this handler:
+// 1. Updates card status to "running" via MC REST API
+// 2. Spawns an OpenClaw agent session via the `openclaw agent` CLI
+// 3. Streams agent output to the card's logFile for real-time SSE
+// 4. Updates card status to "complete" or "failed" when done
+
+const MC_STATE_PATH = "/data/.gstack/missioncontrol-server.json";
+const activeWebhookCards = new Map(); // cardId → AbortController
+
+function readMcState() {
+  try {
+    return JSON.parse(fs.readFileSync(MC_STATE_PATH, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+async function mcPatch(cardId, updates) {
+  const state = readMcState();
+  if (!state) throw new Error("MC state file not found");
+
+  const res = await fetch(`http://127.0.0.1:${state.port}/api/cards/${cardId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${state.token}`,
+    },
+    body: JSON.stringify(updates),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`MC PATCH ${cardId} failed (${res.status}): ${text}`);
+  }
+  return res.json();
+}
+
+function buildAgentMessage(skill, card) {
+  return [
+    "AUTOMATED EXECUTION — Mission Control pipeline.",
+    "Do NOT use AskUserQuestion or ask for clarification.",
+    "Use the task context below as your complete input.",
+    "When you are done, output a brief summary of what you accomplished.",
+    "",
+    "## Task",
+    `**${card.title}**`,
+    card.description || "(no description provided)",
+    card.tags?.length ? `Tags: ${card.tags.join(", ")}` : "",
+    "",
+    skill,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function handleMcWebhook(payload) {
+  const { skill, card, logFile } = payload;
+  if (!skill || !card?.id || !logFile) {
+    console.warn("[hooks] Invalid MC webhook payload, missing skill/card/logFile");
+    return;
+  }
+
+  if (activeWebhookCards.has(card.id)) {
+    console.log(`[hooks] Card ${card.id} already running, skipping`);
+    return;
+  }
+
+  const abort = new AbortController();
+  activeWebhookCards.set(card.id, abort);
+
+  try {
+    // 1. Update card to "running"
+    await mcPatch(card.id, { status: "running" });
+    console.log(`[hooks] Card ${card.id} → running (${skill})`);
+
+    // 2. Ensure log directory + write initial status
+    const logDir = path.dirname(logFile);
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(logFile, `[Mission Control] Starting ${skill} for: ${card.title}\n\n`);
+
+    // 3. Spawn OpenClaw agent via CLI
+    const sessionKey = `mc:card:${card.id}`;
+    const message = buildAgentMessage(skill, card);
+
+    const agentArgs = clawArgs([
+      "agent",
+      "--session-id",
+      sessionKey,
+      "--message",
+      message,
+      "--timeout",
+      "1200", // 20 minutes
+    ]);
+
+    const agentResult = await new Promise((resolve) => {
+      const proc = childProcess.spawn(OPENCLAW_NODE, agentArgs, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          OPENCLAW_STATE_DIR: STATE_DIR,
+          OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+        },
+      });
+
+      const logStream = fs.createWriteStream(logFile, { flags: "a" });
+
+      proc.stdout.on("data", (chunk) => {
+        logStream.write(chunk);
+      });
+      proc.stderr.on("data", (chunk) => {
+        logStream.write(chunk);
+      });
+
+      const timeout = setTimeout(() => {
+        console.warn(`[hooks] Card ${card.id} timed out after 20 minutes`);
+        proc.kill("SIGTERM");
+      }, 20 * 60 * 1000);
+
+      proc.on("error", (err) => {
+        clearTimeout(timeout);
+        logStream.write(`\n[Mission Control] Process error: ${err.message}\n`);
+        logStream.end();
+        resolve({ code: 127, error: err.message });
+      });
+
+      proc.on("exit", (code) => {
+        clearTimeout(timeout);
+        logStream.write(`\n[Mission Control] Agent finished (exit code: ${code})\n`);
+        logStream.end();
+        resolve({ code: code ?? 1 });
+      });
+
+      // Handle abort
+      abort.signal.addEventListener("abort", () => {
+        clearTimeout(timeout);
+        proc.kill("SIGTERM");
+      });
+    });
+
+    // 4. Update card status based on result
+    const finalStatus = agentResult.code === 0 ? "complete" : "failed";
+    await mcPatch(card.id, { status: finalStatus });
+    console.log(`[hooks] Card ${card.id} → ${finalStatus} (exit ${agentResult.code})`);
+  } catch (err) {
+    console.error(`[hooks] Card ${card.id} failed:`, err.message);
+    try {
+      fs.appendFileSync(logFile, `\n[Mission Control] ERROR: ${err.message}\n`);
+      await mcPatch(card.id, { status: "failed" });
+    } catch (patchErr) {
+      console.error(`[hooks] Failed to update card ${card.id} status:`, patchErr.message);
+    }
+  } finally {
+    activeWebhookCards.delete(card.id);
+  }
 }
 
 function requireSetupAuth(req, res, next) {
@@ -1483,6 +1639,28 @@ function attachGatewayAuthHeader(req) {
 
 proxy.on("proxyReqWs", (_proxyReq, req) => {
   attachGatewayAuthHeader(req);
+});
+
+// ── Mission Control webhook endpoint ─────────────────────────────────────────
+// MC fires POST /hooks/missioncontrol when a card moves to a skill column.
+// Respond immediately, process asynchronously.
+app.post("/hooks/missioncontrol", express.json(), (req, res) => {
+  const payload = req.body;
+  console.log(
+    `[hooks] Received MC webhook: event=${payload?.event} skill=${payload?.skill} card=${payload?.card?.id}`,
+  );
+
+  if (payload?.event !== "card_moved" || !payload?.skill) {
+    return res.json({ ok: true, skipped: true, reason: "not a skill trigger" });
+  }
+
+  // Fire-and-forget — respond immediately so MC doesn't block
+  res.json({ ok: true, accepted: true });
+
+  // Process asynchronously
+  handleMcWebhook(payload).catch((err) => {
+    console.error(`[hooks] Unhandled error in MC webhook handler:`, err);
+  });
 });
 
 // Mission Control — proxy /missioncontrol/* to the internal MC server.
