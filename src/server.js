@@ -196,7 +196,6 @@ async function startGateway() {
     OPENCLAW_GATEWAY_TOKEN,
   ];
 
-  console.log(`[gateway] token debug: length=${OPENCLAW_GATEWAY_TOKEN?.length} first4=${OPENCLAW_GATEWAY_TOKEN?.substring(0, 4)} last4=${OPENCLAW_GATEWAY_TOKEN?.substring(OPENCLAW_GATEWAY_TOKEN.length - 4)}`);
 
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
@@ -403,7 +402,7 @@ async function handleMcWebhook(payload) {
     fs.writeFileSync(logFile, `[Mission Control] Starting ${skill} for: ${card.title}\n\n`);
 
     // 3. Spawn OpenClaw agent via CLI
-    const sessionKey = `mc:card:${card.id}`;
+    const sessionKey = `mc-card-${card.id}`;
     const message = buildAgentMessage(skill, card);
 
     const agentArgs = clawArgs([
@@ -514,33 +513,7 @@ app.use((req, res, next) => {
 // Minimal health endpoint for Northflank.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
 
-// Debug: token diagnostic (temporary — remove after debugging)
-app.get("/setup/api/token-debug", requireSetupAuth, (_req, res) => {
-  const envToken = process.env.OPENCLAW_GATEWAY_TOKEN || "";
-  const fileToken = (() => {
-    try { return fs.readFileSync(path.join(STATE_DIR, "gateway.token"), "utf8").trim(); } catch { return "(file-not-found)"; }
-  })();
-  const configToken = (() => {
-    try {
-      const raw = fs.readFileSync(path.join(STATE_DIR, "openclaw.json"), "utf8");
-      const cfg = JSON.parse(raw);
-      return cfg?.gateway?.auth?.token || "(not-in-config)";
-    } catch { return "(config-read-error)"; }
-  })();
-  res.json({
-    envTokenLength: envToken.length,
-    envTokenFirst8: envToken.substring(0, 8),
-    envTokenLast4: envToken.substring(envToken.length - 4),
-    fileTokenLength: fileToken.length,
-    fileTokenFirst8: fileToken.substring(0, 8),
-    fileTokenLast4: fileToken.substring(fileToken.length - 4),
-    configTokenLength: configToken.length,
-    configTokenFirst8: configToken.substring(0, 8),
-    configTokenLast4: configToken.substring(configToken.length - 4),
-    tokensMatch: envToken === configToken && envToken === fileToken,
-    wrapperToken: OPENCLAW_GATEWAY_TOKEN,
-  });
-});
+
 
 async function probeGateway() {
   // Don't assume HTTP — the gateway primarily speaks WebSocket.
