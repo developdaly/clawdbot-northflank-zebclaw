@@ -1,6 +1,7 @@
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
@@ -1378,28 +1379,45 @@ const MC_FETCH_PATCH =
   'if(typeof u==="string"&&(u.startsWith("/api/")||u.startsWith("/auth/"))){u="/missioncontrol"+u;}' +
   'return _f.call(this,u,o);};})();</script>';
 
-mcProxy.on("proxyRes", (proxyRes, req, res) => {
-  const ct = proxyRes.headers["content-type"] || "";
-  if (!ct.includes("text/html")) return;
-
-  // Buffer the full HTML body, inject our script, then send it.
-  const chunks = [];
-  proxyRes.on("data", (chunk) => chunks.push(chunk));
-  proxyRes.on("end", () => {
-    let body = Buffer.concat(chunks).toString("utf8");
-    body = body.replace("</head>", MC_FETCH_PATCH + "</head>");
-    const buf = Buffer.from(body, "utf8");
-    // Remove transfer-encoding so we can set content-length.
-    delete proxyRes.headers["transfer-encoding"];
-    res.writeHead(proxyRes.statusCode, {
-      ...proxyRes.headers,
-      "content-length": buf.length,
+// Fetch the MC board HTML directly, inject the fetch-patch script, and return it.
+function serveMcBoardWithPatch(req, res) {
+  const options = {
+    hostname: MC_INTERNAL_HOST,
+    port: parseInt(MC_INTERNAL_PORT, 10),
+    path: req.url || "/",
+    method: "GET",
+    headers: { host: `${MC_INTERNAL_HOST}:${MC_INTERNAL_PORT}` },
+  };
+  const proxyReq = http.request(options, (proxyRes) => {
+    const ct = proxyRes.headers["content-type"] || "";
+    if (!ct.includes("text/html")) {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+      return;
+    }
+    const chunks = [];
+    proxyRes.on("data", (chunk) => chunks.push(chunk));
+    proxyRes.on("end", () => {
+      let body = Buffer.concat(chunks).toString("utf8");
+      body = body.replace("</head>", MC_FETCH_PATCH + "</head>");
+      const buf = Buffer.from(body, "utf8");
+      delete proxyRes.headers["transfer-encoding"];
+      res.writeHead(proxyRes.statusCode, {
+        ...proxyRes.headers,
+        "content-length": String(buf.length),
+      });
+      res.end(buf);
     });
-    res.end(buf);
   });
-  // Prevent http-proxy from piping the original response.
-  proxyRes.socket = null;
-});
+  proxyReq.on("error", (err) => {
+    console.error("[missioncontrol] Board fetch error:", err.message);
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Mission Control unavailable" }));
+    }
+  });
+  proxyReq.end();
+}
 
 mcProxy.on("error", (err, _req, res) => {
   console.error("[missioncontrol] proxy error:", err.message);
@@ -1465,15 +1483,22 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
 // Mission Control — proxy /missioncontrol/* to the internal MC server.
 // Express strips the /missioncontrol prefix from req.url before calling this handler,
 // so /missioncontrol/api/state → /api/state as seen by the MC server.
-app.use("/missioncontrol", (_req, res, next) => {
-  // MC manages its own auth via MISSION_CONTROL_PASSWORD — don't apply dashboard auth here.
-  mcProxy.web(_req, res, {}, (err) => {
-    console.error(`[missioncontrol] Proxy error: ${String(err)}`);
-    if (!res.headersSent) {
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Mission Control unavailable" }));
-    }
-  });
+//
+// Board HTML requests are handled directly so we can inject the fetch-patch
+// script that re-prefixes /api/ and /auth/ calls with /missioncontrol.
+app.use("/missioncontrol", (req, res) => {
+  // API and auth calls — proxy normally (JSON responses, no injection needed).
+  if (req.url.startsWith("/api") || req.url.startsWith("/auth")) {
+    return mcProxy.web(req, res, {}, (err) => {
+      console.error(`[missioncontrol] Proxy error: ${String(err)}`);
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Mission Control unavailable" }));
+      }
+    });
+  }
+  // Board HTML — fetch directly so we can inject the fetch-patch script.
+  serveMcBoardWithPatch(req, res);
 });
 
 app.use(requireDashboardAuth, async (req, res) => {
