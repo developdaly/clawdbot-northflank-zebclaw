@@ -346,7 +346,12 @@ function requireSetupAuth(req, res, next) {
 
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "1mb" }));
+// Skip body parsing for proxied routes — consuming the body stream here
+// prevents http-proxy from forwarding it, causing "socket hang up" errors.
+app.use((req, res, next) => {
+  if (req.path.startsWith("/missioncontrol")) return next();
+  express.json({ limit: "1mb" })(req, res, next);
+});
 
 // Minimal health endpoint for Northflank.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
