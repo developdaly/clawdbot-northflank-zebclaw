@@ -281,6 +281,15 @@ let mcProcess = null;
 function startMissionControl() {
   if (mcProcess) return;
 
+  // Prefer the live gstack install on the persistent volume; fall back to the
+  // version baked into the Docker image.
+  const MC_SRC_VOLUME = "/data/.openclaw/skills/gstack/missioncontrol/src/server.ts";
+  const MC_SRC_IMAGE  = "/missioncontrol/src/server.ts";
+  const mcSrc = fs.existsSync(MC_SRC_VOLUME) ? MC_SRC_VOLUME : MC_SRC_IMAGE;
+
+  // Ensure the state directory exists before MC tries to write to it.
+  fs.mkdirSync("/data/.gstack", { recursive: true });
+
   const mcEnv = {
     ...process.env,
     MC_PORT: MC_INTERNAL_PORT,
@@ -289,8 +298,9 @@ function startMissionControl() {
     OPENCLAW_WEBHOOK_URL: `http://127.0.0.1:${INTERNAL_GATEWAY_PORT}/hooks`,
   };
 
+  console.log(`[missioncontrol] Using source: ${mcSrc}`);
   mcProcess = childProcess.spawn(
-    "bun", ["run", "/missioncontrol/src/server.ts"],
+    "bun", ["run", mcSrc],
     { env: mcEnv, stdio: "inherit" },
   );
 
@@ -1358,6 +1368,37 @@ const proxy = httpProxy.createProxyServer({
 const mcProxy = httpProxy.createProxyServer({
   target: `http://${MC_INTERNAL_HOST}:${MC_INTERNAL_PORT}`,
   xfwd: true,
+});
+
+// Inject a fetch-patch script into MC's HTML page so that browser-side JS
+// calls like /api/state are rewritten to /missioncontrol/api/state.  The MC
+// server strips the prefix server-side, but the browser doesn't know about it.
+const MC_FETCH_PATCH =
+  '<script>(function(){var _f=window.fetch;window.fetch=function(u,o){' +
+  'if(typeof u==="string"&&(u.startsWith("/api/")||u.startsWith("/auth/"))){u="/missioncontrol"+u;}' +
+  'return _f.call(this,u,o);};})();</script>';
+
+mcProxy.on("proxyRes", (proxyRes, req, res) => {
+  const ct = proxyRes.headers["content-type"] || "";
+  if (!ct.includes("text/html")) return;
+
+  // Buffer the full HTML body, inject our script, then send it.
+  const chunks = [];
+  proxyRes.on("data", (chunk) => chunks.push(chunk));
+  proxyRes.on("end", () => {
+    let body = Buffer.concat(chunks).toString("utf8");
+    body = body.replace("</head>", MC_FETCH_PATCH + "</head>");
+    const buf = Buffer.from(body, "utf8");
+    // Remove transfer-encoding so we can set content-length.
+    delete proxyRes.headers["transfer-encoding"];
+    res.writeHead(proxyRes.statusCode, {
+      ...proxyRes.headers,
+      "content-length": buf.length,
+    });
+    res.end(buf);
+  });
+  // Prevent http-proxy from piping the original response.
+  proxyRes.socket = null;
 });
 
 mcProxy.on("error", (err, _req, res) => {
