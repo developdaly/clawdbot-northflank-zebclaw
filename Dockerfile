@@ -1,3 +1,15 @@
+# ============================================================================
+# Runtime image layout:
+#   /openclaw          – OpenClaw built from source (full repo + dist)
+#   /missioncontrol    – Mission Control: compiled CLI binary + TS source
+#   /app               – This project's wrapper server (server.js)
+#   /data              – Northflank persistent volume (mounted at runtime)
+#
+# Two build stages produce artifacts that are COPY'd into the runtime image.
+# The wrapper server (/app/src/server.js) orchestrates OpenClaw and MC as
+# child processes, proxying external traffic to their internal ports.
+# ============================================================================
+
 # Build openclaw from source to avoid npm packaging gaps (some dist files are not shipped).
 FROM node:24-bookworm AS openclaw-build
 
@@ -40,6 +52,15 @@ RUN pnpm ui:install && pnpm ui:build
 
 
 # ── Mission Control build stage ──────────────────────────────────
+# Clones the gstack repo and builds two artifacts from missioncontrol/:
+#   1. dist/missioncontrol  — compiled CLI binary (bun build --compile)
+#   2. src/                 — TypeScript source, needed at runtime because
+#      server.js runs the MC *server* via `bun run /missioncontrol/src/server.ts`
+#      (the compiled binary is the CLI, not the server)
+#
+# NOTE: Build paths (/gstack/missioncontrol/...) differ from runtime paths
+# (/missioncontrol/...) — the COPY instructions in the runtime stage perform
+# this remapping.
 FROM oven/bun:1 AS mc-build
 
 RUN apt-get update \
@@ -53,7 +74,7 @@ RUN git clone --depth 1 --branch "${GSTACK_GIT_REF}" \
 
 WORKDIR /gstack/missioncontrol
 
-# Compile to a self-contained binary
+# Compile CLI to a self-contained binary
 RUN bun build --compile src/cli.ts --outfile dist/missioncontrol
 
 
@@ -61,6 +82,7 @@ RUN bun build --compile src/cli.ts --outfile dist/missioncontrol
 FROM node:22-bookworm
 ENV NODE_ENV=production
 
+# ── System dependencies (Chromium libs for Puppeteer, tini for PID 1) ────
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -106,25 +128,31 @@ ENV PNPM_HOME=/data/pnpm
 ENV PNPM_STORE_DIR=/data/pnpm-store
 ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
 
+# ── Wrapper application ──────────────────────────────────────────
 WORKDIR /app
 
 # Wrapper deps
 COPY package.json ./
 RUN npm install --omit=dev && npm cache clean --force
 
-# Copy built openclaw
+# ── OpenClaw ─────────────────────────────────────────────────────
+# Full built repo (including node_modules and dist/).
+# server.js runs the entry point at /openclaw/dist/entry.js.
 COPY --from=openclaw-build /openclaw /openclaw
 
 # Provide an openclaw executable
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"' > /usr/local/bin/openclaw \
   && chmod +x /usr/local/bin/openclaw
 
-# Add Bun runtime (needed by Mission Control server.ts)
+# Bun runtime — used to run Mission Control's server.ts via `bun run`
 COPY --from=oven/bun:1 /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=oven/bun:1 /usr/local/bin/bunx /usr/local/bin/bunx
 
-# Copy Mission Control compiled binary and TypeScript source
+# ── Mission Control artifacts ────────────────────────────────────
+# Source path remapping: /gstack/missioncontrol/... → /missioncontrol/...
+# Binary: CLI tool compiled from src/cli.ts
 COPY --from=mc-build /gstack/missioncontrol/dist/missioncontrol /missioncontrol/dist/missioncontrol
+# Source: server.ts is run via `bun run` at runtime (see startMissionControl in server.js)
 COPY --from=mc-build /gstack/missioncontrol/src/ /missioncontrol/src/
 RUN echo "built" > /missioncontrol/dist/.version
 
